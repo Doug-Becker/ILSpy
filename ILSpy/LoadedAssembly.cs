@@ -571,6 +571,7 @@ namespace ICSharpCode.ILSpy
 				}
 				else
 				{
+					//Trace.WriteLine($"Assembly not found, {reference.FullName} for {key}");
 					// Assembly not found; try to find a similar-enough already-loaded assembly
 					var candidates = new List<(LoadedAssembly assembly, Version version)>();
 
