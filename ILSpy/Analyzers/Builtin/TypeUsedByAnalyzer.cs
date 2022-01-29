@@ -17,10 +17,12 @@
 // DEALINGS IN THE SOFTWARE.
 
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.Diagnostics;
 using System.Reflection.Metadata;
+using System.Linq;
 
 using ICSharpCode.Decompiler;
 using ICSharpCode.Decompiler.Disassembler;
@@ -39,11 +41,16 @@ namespace ICSharpCode.ILSpy.Analyzers.Builtin
 		{
 			Debug.Assert(analyzedSymbol is ITypeDefinition);
 			var scope = context.GetScopeOf((ITypeDefinition)analyzedSymbol);
-			foreach (var type in scope.GetTypesInScope(context.CancellationToken))
+			var symbols = scope.GetTypesInScope(context.CancellationToken).AsParallel().SelectMany(
+					type => ScanType((ITypeDefinition)analyzedSymbol, type, context).AsParallel()
+				);
+			// this seemingly unnecessary foreach loop allows cleanup of the dictionary when the enumeration
+			// is complete
+			foreach (var symbol in symbols)
 			{
-				foreach (var result in ScanType((ITypeDefinition)analyzedSymbol, type, context))
-					yield return result;
+				yield return symbol;
 			}
+			memberLookup.Clear();
 		}
 
 		IEnumerable<IEntity> ScanType(ITypeDefinition analyzedEntity, ITypeDefinition type, AnalyzerContext context)
@@ -107,8 +114,15 @@ namespace ICSharpCode.ILSpy.Analyzers.Builtin
 			}
 		}
 
+		private ConcurrentDictionary<(IMember, bool), bool> memberLookup = new ConcurrentDictionary<(IMember, bool), bool>();
 		void VisitMember(TypeDefinitionUsedVisitor visitor, IMember member, AnalyzerContext context, bool scanBodies = false)
 		{
+			if (memberLookup.TryGetValue((member, scanBodies), out bool result))
+			{
+				visitor.Found = result;
+				return;
+			}
+
 			member.DeclaringType.AcceptVisitor(visitor);
 			switch (member)
 			{
@@ -218,6 +232,7 @@ namespace ICSharpCode.ILSpy.Analyzers.Builtin
 
 					break;
 			}
+			memberLookup.TryAdd((member, scanBodies), visitor.Found);
 		}
 
 		void ScanMethodBody(TypeDefinitionUsedVisitor visitor, IMethod method, MethodBodyBlock methodBody, AnalyzerContext context)
