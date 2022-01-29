@@ -18,6 +18,7 @@
 
 using System;
 using System.Buffers;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -489,6 +490,7 @@ namespace ICSharpCode.ILSpy
 				// in previous Resolve() calls; but we don't want to wait for those to be loaded.
 				this.tfmTask = parent.GetTargetFrameworkIdAsync();
 				this.referenceLoadInfo = parent.LoadedAssemblyReferencesInfo;
+
 			}
 
 			public PEFile? Resolve(IAssemblyReference reference)
@@ -496,8 +498,9 @@ namespace ICSharpCode.ILSpy
 				return ResolveAsync(reference).GetAwaiter().GetResult();
 			}
 
-			Dictionary<string, PEFile>? asmLookupByFullName;
-			Dictionary<string, PEFile>? asmLookupByShortName;
+			// try maintain a single assembly dictionary per assembly list
+			// may need to worry about the "cache a copy" statement above
+			static ConcurrentDictionary<AssemblyList, ConcurrentDictionary<string, PEFile?>> assemblyListDictionaries = new();
 
 			/// <summary>
 			/// 0) if we're inside a package, look for filename.dll in parent directories
@@ -524,16 +527,18 @@ namespace ICSharpCode.ILSpy
 
 				string tfm = await tfmTask.ConfigureAwait(false);
 
+
+
 				bool isWinRT = reference.IsWindowsRuntime;
 				string key = tfm + ";" + (isWinRT ? reference.Name : reference.FullName);
 
-				// 1) try to find exact match by tfm + full asm name in loaded assemblies
-				var lookup = LazyInit.VolatileRead(ref isWinRT ? ref asmLookupByShortName : ref asmLookupByFullName);
-				if (lookup == null)
+				ConcurrentDictionary<string, PEFile?> lookup;
+				if (!assemblyListDictionaries.TryGetValue(assemblyList, out lookup))
 				{
 					lookup = await CreateLoadedAssemblyLookupAsync(shortNames: isWinRT).ConfigureAwait(false);
-					lookup = LazyInit.GetOrSet(ref isWinRT ? ref asmLookupByShortName : ref asmLookupByFullName, lookup);
+					assemblyListDictionaries.TryAdd(assemblyList, lookup);
 				}
+
 				if (lookup.TryGetValue(key, out module))
 				{
 					referenceLoadInfo.AddMessageOnce(reference.FullName, MessageKind.Info, "Success - Found in Assembly List");
@@ -557,12 +562,16 @@ namespace ICSharpCode.ILSpy
 					if (asm != null)
 					{
 						referenceLoadInfo.AddMessage(reference.ToString(), MessageKind.Info, "Success - Loading from: " + file);
-						return await asm.GetPEFileOrNullAsync().ConfigureAwait(false);
+						module = await asm.GetPEFileOrNullAsync().ConfigureAwait(false);
+						lookup.TryAdd(key, module!);
+						return module;
 					}
+					lookup.TryAdd(key, null);
 					return null;
 				}
 				else
 				{
+					//Trace.WriteLine($"Assembly not found, {reference.FullName} for {key}");
 					// Assembly not found; try to find a similar-enough already-loaded assembly
 					var candidates = new List<(LoadedAssembly assembly, Version version)>();
 
@@ -583,6 +592,7 @@ namespace ICSharpCode.ILSpy
 					if (candidates.Count == 0)
 					{
 						referenceLoadInfo.AddMessageOnce(reference.ToString(), MessageKind.Error, "Could not find reference: " + reference);
+						lookup.TryAdd(key, null);
 						return null;
 					}
 
@@ -590,13 +600,15 @@ namespace ICSharpCode.ILSpy
 
 					var bestCandidate = candidates.FirstOrDefault(c => c.version >= reference.Version).assembly ?? candidates.Last().assembly;
 					referenceLoadInfo.AddMessageOnce(reference.ToString(), MessageKind.Info, "Success - Found in Assembly List with different TFM or version: " + bestCandidate.fileName);
-					return await bestCandidate.GetPEFileOrNullAsync().ConfigureAwait(false);
+					module = await bestCandidate.GetPEFileOrNullAsync().ConfigureAwait(false);
+					lookup.TryAdd(key, module!);
+					return module;
 				}
 			}
 
-			private async Task<Dictionary<string, PEFile>> CreateLoadedAssemblyLookupAsync(bool shortNames)
+			private async Task<ConcurrentDictionary<string, PEFile?>> CreateLoadedAssemblyLookupAsync(bool shortNames)
 			{
-				var result = new Dictionary<string, PEFile>(StringComparer.OrdinalIgnoreCase);
+				var result = new ConcurrentDictionary<string, PEFile?>(StringComparer.OrdinalIgnoreCase);
 				foreach (LoadedAssembly loaded in alreadyLoadedAssemblies)
 				{
 					try
@@ -612,7 +624,7 @@ namespace ICSharpCode.ILSpy
 							+ (shortNames ? module.Name : module.FullName);
 						if (!result.ContainsKey(key))
 						{
-							result.Add(key, module);
+							result.TryAdd(key, module);
 						}
 					}
 					catch (BadImageFormatException)
